@@ -1,6 +1,6 @@
-# Lucy
+# Lucy: Gesture Volume Control for Windows
 
-Control your Windows volume with hand gestures, using just your laptop webcam.
+Lucy is a gesture volume control app: change your Windows volume with hand gestures, using just your laptop webcam.
 
 Pinch or spread your thumb and index finger to set the volume, hold still to lock it, and make a fist to mute. It works system-wide (YouTube, Spotify, games…), keeps running while minimised, and shows the native Windows volume pop-up.
 
@@ -24,7 +24,7 @@ Pinch or spread your thumb and index finger to set the volume, hold still to loc
 ## Setup
 
 ```powershell
-git clone <this repository>
+git clone https://github.com/NgJyeKang11/Lucy.git
 cd Lucy
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
