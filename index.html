@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lucy</title>
+<style>
+  :root { color-scheme: dark; --accent: #4ade80; --lock: #fbbf24; --warn: #f87171; --muted: #94a3b8; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.4 system-ui, sans-serif; background: #0f172a; color: #e2e8f0;
+         display: flex; gap: 24px; padding: 24px; flex-wrap: wrap; justify-content: center; }
+  canvas { display: block; border-radius: 12px; background: #000; max-width: 100%; height: auto; }
+  video { display: none; }
+  #panel { width: 320px; display: flex; flex-direction: column; gap: 12px; }
+  .card { background: #1e293b; border-radius: 12px; padding: 14px 16px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .big { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bar { height: 12px; background: #334155; border-radius: 6px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .08s; }
+  #mode { font-weight: 600; }
+  .muted-label { color: var(--muted); font-size: 13px; }
+  label { display: block; margin-top: 8px; font-size: 13px; color: var(--muted); }
+  input[type=range] { width: 100%; }
+  summary { cursor: pointer; font-weight: 600; }
+  ul { margin: 8px 0 0; padding-left: 18px; }
+  li { margin: 4px 0; }
+  #error { color: var(--warn); white-space: pre-wrap; }
+  button { background: #334155; color: inherit; border: 0; border-radius: 8px; padding: 6px 14px; font: inherit; cursor: pointer; }
+  button:hover { background: #b91c1c; }
+  label.check { display: flex; gap: 8px; align-items: center; color: inherit; font-size: 14px; }
+  /* Compact layout for the small app window */
+  @media (max-width: 760px) {
+    body { padding: 10px; gap: 10px; }
+    #stage, #panel { width: 100%; }
+    canvas { width: 100%; }
+    .big { font-size: 36px; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas" width="640" height="480"></canvas>
+</div>
+
+<div id="panel">
+  <div class="card">
+    <h1>Lucy</h1><div class="muted-label">Gesture volume control</div>
+    <div class="muted-label" id="status">Loading hand tracker…</div>
+    <div id="error"></div>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px">
+      <label class="check" style="margin:0"><input type="checkbox" id="enabled" checked> Gesture control on</label>
+      <button id="quit" title="Stop Lucy and close this window">Quit</button>
+    </div>
+    <label class="check"><input type="checkbox" id="osd" checked> Show Windows volume pop-up</label>
+  </div>
+
+  <div class="card">
+    <div class="big" id="volText">--%</div>
+    <div class="bar"><div id="volBar"></div></div>
+    <p style="margin:8px 0 0">Mode: <span id="mode">—</span></p>
+  </div>
+
+  <details class="card">
+    <summary>How to use</summary>
+    <ul>
+      <li><b>Set volume:</b> curl your middle, ring and pinky fingers, then pinch or spread your thumb and index finger.</li>
+      <li><b>Lock a value:</b> hold your fingers still until the ring fills and turns amber. Small movements are then ignored, so you can open your hand safely.</li>
+      <li><b>Re-adjust while locked:</b> move your fingers clearly further apart or closer together.</li>
+      <li><b>Mute / unmute:</b> make a fist and hold it for about 1 second. While muted, the volume is frozen; only the fist works.</li>
+    </ul>
+  </details>
+
+  <details class="card">
+    <summary>Calibration</summary>
+    <div class="muted-label" style="margin-top:8px">Current spread: <span id="ratio">–</span> · <span id="fps">0</span> fps</div>
+    <label>Pinch (0%) at spread ≤ <span id="minRVal"></span>
+      <input id="minR" type="range" min="0.05" max="1" step="0.01" value="0.25"></label>
+    <label>Spread (100%) at spread ≥ <span id="maxRVal"></span>
+      <input id="maxR" type="range" min="0.5" max="2.5" step="0.01" value="1.3"></label>
+    <label>Smoothing <span id="smoothVal"></span>
+      <input id="smooth" type="range" min="0" max="0.9" step="0.05" value="0.6"></label>
+    <label>Volume step <span id="stepVal"></span>
+      <input id="step" type="range" min="1" max="10" step="1" value="2"></label>
+    <label>Hold still to lock <span id="holdVal"></span>
+      <input id="hold" type="range" min="300" max="2000" step="50" value="700"></label>
+    <label>Unlock distance <span id="unlockVal"></span>
+      <input id="unlock" type="range" min="3" max="25" step="1" value="10"></label>
+    <label>Pose must be held before adjusting <span id="armVal"></span>
+      <input id="arm" type="range" min="0" max="800" step="25" value="300"></label>
+    <label>Release rollback <span id="rollbackVal"></span>
+      <input id="rollback" type="range" min="0" max="1000" step="25" value="400"></label>
+  </details>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+const pct = (v) => Math.round(v * 100);
+
+// ---- Settings (persisted in localStorage) ---------------------------------
+const SETTINGS = {
+  minR: (v) => (+v).toFixed(2), maxR: (v) => (+v).toFixed(2), smooth: (v) => (+v).toFixed(2),
+  step: (v) => v + "%", hold: (v) => v + " ms", unlock: (v) => v + "%",
+  arm: (v) => v + " ms", rollback: (v) => v + " ms",
+};
+for (const id of Object.keys(SETTINGS)) {
+  const saved = localStorage.getItem("gv_" + id);
+  if (saved !== null) $(id).value = saved;
+  const show = () => { $(id + "Val").textContent = SETTINGS[id]($(id).value); };
+  $(id).addEventListener("input", () => { localStorage.setItem("gv_" + id, $(id).value); show(); });
+  show();
+}
+const S = (id) => +$(id).value;
+$("osd").checked = localStorage.getItem("gv_osd") !== "0";
+$("osd").addEventListener("change", () => localStorage.setItem("gv_osd", $("osd").checked ? "1" : "0"));
+const osd = () => $("osd").checked;
+$("enabled").checked = localStorage.getItem("gv_enabled") !== "0";
+$("enabled").addEventListener("change", () => {
+  localStorage.setItem("gv_enabled", $("enabled").checked ? "1" : "0");
+  resetControl();
+});
+
+// ---- Server API -----------------------------------------------------------
+let volume = null, muted = false;
+let pendingLevel = null, inflight = false;
+
+function render() {
+  if (volume === null) return;
+  $("volText").textContent = muted ? "Muted" : pct(volume) + "%";
+  $("volText").style.color = muted ? "var(--warn)" : "";
+  $("volBar").style.width = pct(volume) + "%";
+  $("volBar").style.background = muted ? "var(--warn)" : "";
+}
+
+async function api(body) {
+  const res = await fetch("/api/volume", body ? {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  } : undefined);
+  if (!res.ok) throw new Error("Server error " + res.status);
+  const state = await res.json();
+  volume = state.level; muted = state.muted; render();
+  $("error").textContent = "";
+}
+
+// Only one request in flight; always send the most recent level.
+async function pushLevel(level) {
+  pendingLevel = level;
+  if (inflight) return;
+  inflight = true;
+  try {
+    while (pendingLevel !== null) {
+      const l = pendingLevel; pendingLevel = null;
+      await api({ level: l, osd: osd() });
+    }
+  } catch { $("error").textContent = "Can't reach the volume server. Is server.py running?"; }
+  inflight = false;
+}
+
+function setLevel(level) {
+  if (muted) return;  // never change the volume while muted
+  if (volume !== null && Math.abs(level - volume) < 0.005) return;
+  volume = level; render(); pushLevel(level);
+}
+
+// ---- Pose detection -------------------------------------------------------
+const W = () => canvas.width, H = () => canvas.height;
+const px = (p) => ({ x: p.x * W(), y: p.y * H() });
+const dist = (a, b) => { a = px(a); b = px(b); return Math.hypot(a.x - b.x, a.y - b.y); };
+// A finger is curled when its tip is closer to the wrist than its middle joint.
+const curled = (lm, tip, pip) => dist(lm[tip], lm[0]) < dist(lm[pip], lm[0]);
+
+function classify(lm) {
+  const indexUp = !curled(lm, 8, 6);
+  const othersDown = curled(lm, 12, 10) && curled(lm, 16, 14) && curled(lm, 20, 18);
+  if (!indexUp && othersDown) return "fist";
+  if (indexUp && othersDown) return "control";
+  return "open";
+}
+
+// Debounced pose: a new pose only "counts" once it has been seen continuously
+// for a while. This filters out the in-between shapes your hand passes through
+// (e.g. opening a fist briefly looks like the control pose).
+let rawPose = "none", rawSince = 0, pose = "none";
+function updatePose(p, now) {
+  if (p !== rawPose) { rawPose = p; rawSince = now; }
+  const need = p === "control" ? S("arm") : p === "fist" ? 120 : 80;
+  if (p !== pose && now - rawSince >= need) pose = p;
+  return pose;
+}
+
+// ---- Volume control state -------------------------------------------------
+const FIST_HOLD_MS = 900, MUTE_COOLDOWN_MS = 1200;
+let smoothed = null;
+let fistSince = null, fistHandled = false, cooldownUntil = 0;
+let history = [];                 // recent [{t, level}] for release rollback
+let holdLocked = false, lockedLevel = null;
+let dwellLevel = null, dwellStart = 0;
+let displayLock = null;           // last locked value, for the status line
+
+function resetControl() {
+  smoothed = null; history = [];
+  holdLocked = false; lockedLevel = null; dwellLevel = null;
+}
+
+// Called when the control pose ends. If the value was hold-locked, keep it.
+// Otherwise snap back to the level from a moment before release.
+function releaseControl(now) {
+  if (!holdLocked && history.length) {
+    const target = now - S("rollback");
+    let entry = history[0];
+    for (const h of history) { if (h.t <= target) entry = h; else break; }
+    setLevel(entry.level);
+    displayLock = entry.level;
+  } else if (holdLocked) {
+    displayLock = lockedLevel;
+  }
+  resetControl();
+}
+
+function handleHand(lm, now) {
+  const handSize = dist(lm[0], lm[9]);              // wrist -> middle knuckle
+  const ratio = dist(lm[4], lm[8]) / handSize;       // thumb tip <-> index tip
+  $("ratio").textContent = ratio.toFixed(2);
+
+  const p = updatePose(classify(lm), now);
+
+  // --- Fist: hold to toggle mute ---
+  if (p === "fist") {
+    if (smoothed !== null || history.length) releaseControl(now);
+    if (fistSince === null) fistSince = now;
+    const held = now - fistSince;
+    if (!fistHandled && held >= FIST_HOLD_MS) {
+      fistHandled = true;
+      cooldownUntil = now + MUTE_COOLDOWN_MS;
+      api({ muted: !muted, osd: osd() }).catch(() => {});
+    }
+    return { mode: fistHandled ? "Fist (mute toggled)" : "Fist… hold to mute",
+             state: "idle", progress: fistHandled ? 0 : Math.min(1, held / FIST_HOLD_MS) };
+  }
+  fistSince = null; fistHandled = false;
+
+  // --- Control pose ---
+  if (p === "control") {
+    if (now < cooldownUntil) {
+      return { mode: "Just toggled mute: open your hand first", state: "idle" };
+    }
+    // While muted, the volume is frozen; only a fist (unmute) does anything.
+    if (muted) {
+      resetControl();
+      return { mode: "Muted: make a fist to unmute", state: "idle" };
+    }
+    const step = S("step") / 100;
+    let target = (ratio - S("minR")) / (S("maxR") - S("minR"));
+    target = Math.min(1, Math.max(0, target));
+    const a = S("smooth");
+    smoothed = smoothed === null ? target : a * smoothed + (1 - a) * target;
+
+    if (holdLocked) {
+      if (Math.abs(smoothed - lockedLevel) < S("unlock") / 100) {
+        return { mode: `Locked at ${pct(lockedLevel)}%: move more to change`, state: "locked" };
+      }
+      // Deliberate move: unlock. Seed history with the locked value so a quick
+      // release right after still rolls back to it.
+      history = [{ t: now - 1, level: lockedLevel }];
+      holdLocked = false; dwellLevel = null;
+    }
+
+    // Snap to step, with hysteresis so it doesn't flicker between two steps.
+    let level = Math.round(Math.round(smoothed / step) * step * 100) / 100;
+    if (volume !== null && Math.abs(smoothed - volume) < step * 0.75) level = volume;
+
+    history.push({ t: now, level });
+    while (history.length > 1 && now - history[0].t > 2000) history.shift();
+    setLevel(level);
+
+    // Dwell: holding the same value long enough locks it.
+    if (dwellLevel === null || Math.abs(level - dwellLevel) > 0.001) { dwellLevel = level; dwellStart = now; }
+    const progress = Math.min(1, (now - dwellStart) / S("hold"));
+    if (progress >= 1) {
+      holdLocked = true; lockedLevel = level; history = [];
+      return { mode: `Locked at ${pct(level)}%`, state: "locked" };
+    }
+    return { mode: "Adjusting volume", state: "active", progress };
+  }
+
+  // --- Open hand / in-between pose ---
+  if (smoothed !== null || history.length || holdLocked) releaseControl(now);
+  if (rawPose === "control" && pose !== "control") return { mode: "Getting ready…", state: "idle" };
+  return { mode: displayLock !== null ? `Locked at ${pct(displayLock)}%` : "Idle (hand open)", state: "idle" };
+}
+
+// ---- Drawing --------------------------------------------------------------
+const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const COLORS = { active: "#4ade80", locked: "#fbbf24", idle: "#64748b" };
+
+function draw(lm, { state, progress }) {
+  // Video is drawn mirrored; mirror the landmarks to match.
+  const m = (p) => ({ x: (1 - p.x) * W(), y: p.y * H() });
+  ctx.lineWidth = 2; ctx.strokeStyle = "rgba(255,255,255,.6)";
+  for (const [a, b] of CONNECTIONS) {
+    const p = m(lm[a]), q = m(lm[b]);
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+  }
+  ctx.fillStyle = "#fff";
+  for (const p of lm.map(m)) { ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, 7); ctx.fill(); }
+
+  const color = COLORS[state];
+  const t = m(lm[4]), i = m(lm[8]);
+  ctx.strokeStyle = color; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(i.x, i.y); ctx.stroke();
+  ctx.fillStyle = color;
+  for (const p of [t, i]) { ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, 7); ctx.fill(); }
+
+  // Progress ring (lock dwell or mute hold) at the midpoint.
+  const c = { x: (t.x + i.x) / 2, y: (t.y + i.y) / 2 };
+  if (state === "locked" || progress > 0) {
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(255,255,255,.25)";
+    ctx.beginPath(); ctx.arc(c.x, c.y, 18, 0, 7); ctx.stroke();
+    ctx.strokeStyle = state === "locked" ? COLORS.locked : "#fff";
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 18, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * (state === "locked" ? 1 : progress));
+    ctx.stroke();
+  }
+}
+
+// ---- Background worker ----------------------------------------------------
+// Timers in a Web Worker keep running when the window is hidden or minimised
+// (main-thread timers and requestAnimationFrame get throttled or paused).
+// The worker drives the tracking loop and sends the heartbeat to the server,
+// which uses it to shut itself down after the window is closed.
+const workerSrc = `
+  let stats = {};
+  onmessage = (e) => { stats = e.data; };
+  setInterval(() => postMessage("tick"), 33);
+  setInterval(() => {
+    fetch(${JSON.stringify(location.origin)} + "/api/heartbeat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...stats, frameAgeMs: stats.frameAt ? Date.now() - stats.frameAt : null }),
+    }).catch(() => {});
+  }, 2000);
+`;
+const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: "text/javascript" })));
+let onTick = null;
+worker.onmessage = () => { if (onTick) onTick(); };
+
+let frames = 0, fps = 0, lastFrameAt = null;
+setInterval(() => {
+  fps = frames / 2; frames = 0;
+  $("fps").textContent = fps.toFixed(0);
+  worker.postMessage({ fps, hidden: document.hidden, frameAt: lastFrameAt });
+}, 2000);
+
+$("quit").addEventListener("click", async () => {
+  $("status").textContent = "Stopping…";
+  try { await fetch("/api/quit", { method: "POST" }); } catch {}
+  window.close();
+  $("status").textContent = "Stopped. You can close this window.";
+});
+
+// ---- Main -----------------------------------------------------------------
+
+async function main() {
+  try { await api(); } catch { $("error").textContent = "Can't reach the volume server. Start it with start.bat."; }
+
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const landmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numHands: 1,
+  });
+
+  $("status").textContent = "Requesting camera…";
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  $("status").textContent = "Tracking. Works in the background too, so you can minimise this window.";
+
+  let lastTime = -1, busy = false;
+  onTick = () => {
+    if (busy || video.readyState < 2 || video.currentTime === lastTime) return;
+    busy = true;
+    try {
+      lastTime = video.currentTime;
+      const now = performance.now();
+      const result = landmarker.detectForVideo(video, now);
+      frames++; lastFrameAt = Date.now();
+
+      ctx.save(); ctx.translate(W(), 0); ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0, W(), H());
+      ctx.restore();
+
+      if (!$("enabled").checked) {
+        $("mode").textContent = "Paused (gesture control off)";
+      } else if (result.landmarks && result.landmarks.length) {
+        const lm = result.landmarks[0];
+        const info = handleHand(lm, now);
+        $("mode").textContent = info.mode;
+        draw(lm, info);
+      } else {
+        if (smoothed !== null || history.length || holdLocked) releaseControl(now);
+        rawPose = pose = "none"; fistSince = null; fistHandled = false;
+        $("mode").textContent = displayLock !== null ? `No hand (locked at ${pct(displayLock)}%)` : "No hand";
+        $("ratio").textContent = "–";
+      }
+    } finally { busy = false; }
+  };
+}
+
+main().catch((e) => {
+  $("status").textContent = "Stopped.";
+  $("error").textContent = (e && e.name === "NotAllowedError")
+    ? "Camera permission was denied. Allow camera access for this page and reload."
+    : (e && e.name === "NotReadableError")
+    ? "The camera is busy or turned off. Close other apps using it (Zoom, Teams, Camera) or check the camera privacy shutter / Fn key."
+    : "Error: " + (e && e.message ? e.message : e);
+});
+
+// Keep the display in sync if the volume is changed elsewhere (keyboard, mixer).
+setInterval(() => { if (!inflight) api().catch(() => {}); }, 2000);
+</script>
+</body>
+</html>
