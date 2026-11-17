@@ -58,3 +58,7 @@ Why a browser and not OpenCV in Python? On PCs with **Smart App Control** enable
 ## Privacy
 
 Camera frames are processed locally in the browser and never leave your computer. The MediaPipe library and model are downloaded from public CDNs (jsDelivr, Google Cloud Storage) when the window loads. The volume server only listens on `127.0.0.1`.
+
+## License
+
+[MIT](LICENSE)
